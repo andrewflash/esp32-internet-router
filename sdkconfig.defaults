@@ -1,35 +1,17 @@
-# ---------------------------------------------------------------
-# Core: ESP32-WROVER-E (16 MB flash, 8 MB PSRAM)
-# ---------------------------------------------------------------
+# ESP32-WROVER-E: 16 MB flash, 8 MB PSRAM
 CONFIG_ESPTOOLPY_FLASHSIZE_16MB=y
 CONFIG_SPIRAM=y
 CONFIG_SPIRAM_USE_MALLOC=y
 
-# ---------------------------------------------------------------
-# lwIP: enable IP forwarding + NAPT for routing PPP → SoftAP
-# ---------------------------------------------------------------
+# lwIP: IP forwarding and NAPT (required for PPP → SoftAP routing)
+# LWIP_NAPT_TMOUT / LWIP_NAPT_TMOUT_UDP are C-level macros, not Kconfig symbols.
 CONFIG_LWIP_PPP_SUPPORT=y
-CONFIG_LWIP_PPP_SERVER_SUPPORT=n
 CONFIG_LWIP_IP_FORWARD=y
 CONFIG_LWIP_IPV4_NAPT=y
-CONFIG_LWIP_NAPT_TMOUT=7440        # TCP NAT entry timeout (s)
-CONFIG_LWIP_NAPT_TMOUT_UDP=19      # UDP NAT entry timeout (s)
 
-# Larger NAPT tables for multiple concurrent WiFi clients
-CONFIG_LWIP_MAX_SOCKETS=24
-
-# ---------------------------------------------------------------
-# WiFi
-# ---------------------------------------------------------------
+# WiFi RX buffers
 CONFIG_ESP_WIFI_STATIC_RX_BUFFER_NUM=10
 CONFIG_ESP_WIFI_DYNAMIC_RX_BUFFER_NUM=32
 
-# ---------------------------------------------------------------
-# Task watchdog — modem init can be slow
-# ---------------------------------------------------------------
+# Watchdog timeout — modem boot can take several seconds
 CONFIG_ESP_TASK_WDT_TIMEOUT_S=30
-
-# ---------------------------------------------------------------
-# Logging
-# ---------------------------------------------------------------
-CONFIG_LOG_DEFAULT_LEVEL_INFO=y

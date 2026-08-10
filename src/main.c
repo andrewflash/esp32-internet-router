@@ -216,13 +216,11 @@ static void ppp_start(void)
 
 static void napt_enable(void)
 {
-    /*
-     * Enable NAT on the SoftAP netif address (192.168.4.1 by default).
-     * Packets from WiFi clients are translated and sent out via PPP.
-     * _g_esp_netif_soft_ap_ip is the default AP netif IP from esp_wifi_default.c.
-     */
-    extern esp_netif_ip_info_t _g_esp_netif_soft_ap_ip;
-    ip_napt_enable(_g_esp_netif_soft_ap_ip.ip.addr, 1);
+    /* Read the actual configured SoftAP IP, then enable NAPT on it.
+     * ip_napt_enable() is void in IDF 6.x — no return value to check. */
+    esp_netif_ip_info_t ip_info;
+    ESP_ERROR_CHECK(esp_netif_get_ip_info(s_ap_netif, &ip_info));
+    ip_napt_enable(ip_info.ip.addr, 1);
     ESP_LOGI(TAG, "NAPT enabled — WiFi→PPP routing active");
 }
 
