@@ -1,4 +1,14 @@
 dependencies:
+  espressif/cjson:
+    component_hash: e788323270d90738662d66fffa910bfe1fba019bba087f01557e70c40485b469
+    dependencies:
+    - name: idf
+      require: private
+      version: '>=5.0'
+    source:
+      registry_url: https://components.espressif.com/
+      type: service
+    version: 1.7.19~2
   espressif/esp_modem:
     component_hash: 71c9f54fc512c60d93ea9763377ceb1d5b575a4616f3f3344440b97e2a38da29
     dependencies:
@@ -14,8 +24,9 @@ dependencies:
       type: idf
     version: 6.0.1
 direct_dependencies:
+- espressif/cjson
 - espressif/esp_modem
 - idf
-manifest_hash: b0a3900a08fea5b13b1fd7432d9f4e3b82657a728760c48a0acdc290a2ac442d
+manifest_hash: 3877017a9135950d84dcd66837a8de082c3723627b653c6ab82dd364a673accc
 target: esp32
 version: 2.0.0

@@ -1,4 +1,6 @@
 dependencies:
   # A7670E is SIM7600-compatible; esp_modem supports it via ESP_MODEM_DCE_SIM7600
   espressif/esp_modem: "^1.1.0"
+  # IDF 6.0 dropped the bundled "json" component; the web UI parses/prints JSON.
+  espressif/cjson: "^1.7.18"
   idf: ">=5.0.0"

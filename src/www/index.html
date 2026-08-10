@@ -1,0 +1,208 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>4G Router</title>
+<style>
+:root{--bg:#111418;--card:#1b2027;--line:#2b323c;--fg:#e8ecf1;--mut:#96a0ad;--acc:#3ea6ff;--ok:#2ecc71;--bad:#e74c3c}
+@media(prefers-color-scheme:light){:root{--bg:#f2f4f7;--card:#fff;--line:#dde2e8;--fg:#1a1f26;--mut:#667080}}
+*{box-sizing:border-box}
+body{margin:0;font:15px/1.5 system-ui,-apple-system,Segoe UI,Roboto,sans-serif;background:var(--bg);color:var(--fg)}
+header{padding:18px 16px;border-bottom:1px solid var(--line);display:flex;align-items:center;gap:10px}
+header h1{font-size:17px;margin:0;font-weight:600}
+main{max-width:640px;margin:0 auto;padding:16px}
+nav{display:flex;gap:4px;margin-bottom:16px;flex-wrap:wrap}
+nav button{flex:1;min-width:88px;padding:9px 6px;border:1px solid var(--line);background:transparent;color:var(--mut);border-radius:8px;cursor:pointer;font-size:14px}
+nav button.on{background:var(--acc);border-color:var(--acc);color:#04121f;font-weight:600}
+section{display:none;background:var(--card);border:1px solid var(--line);border-radius:12px;padding:16px}
+section.on{display:block}
+h2{font-size:14px;text-transform:uppercase;letter-spacing:.05em;color:var(--mut);margin:0 0 14px}
+label{display:block;margin-bottom:12px;font-size:13px;color:var(--mut)}
+input,select{width:100%;margin-top:4px;padding:9px 10px;border:1px solid var(--line);border-radius:8px;background:var(--bg);color:var(--fg);font-size:15px}
+.row{display:flex;gap:10px}.row>label{flex:1}
+.chk{display:flex;align-items:center;gap:8px;margin-bottom:12px;font-size:13px;color:var(--mut)}
+.chk input{width:auto;margin:0}
+button.act{width:100%;padding:11px;border:0;border-radius:8px;background:var(--acc);color:#04121f;font-weight:600;font-size:15px;cursor:pointer}
+button.danger{background:var(--bad);color:#fff}
+dl{display:grid;grid-template-columns:auto 1fr;gap:8px 14px;margin:0;font-size:14px}
+dt{color:var(--mut)}dd{margin:0;text-align:right;font-variant-numeric:tabular-nums;word-break:break-all}
+.pill{display:inline-block;padding:2px 9px;border-radius:99px;font-size:12px;font-weight:600}
+.up{background:rgba(46,204,113,.15);color:var(--ok)}.down{background:rgba(231,76,60,.15);color:var(--bad)}
+.msg{margin-top:12px;padding:10px;border-radius:8px;font-size:14px;display:none}
+.msg.ok{display:block;background:rgba(46,204,113,.12);color:var(--ok)}
+.msg.err{display:block;background:rgba(231,76,60,.12);color:var(--bad)}
+.hint{font-size:12px;color:var(--mut);margin:-6px 0 14px}
+</style>
+</head>
+<body>
+<header><h1>4G Router</h1><span id="badge" class="pill down">…</span></header>
+<main>
+<nav>
+  <button class="on" data-t="status">Status</button>
+  <button data-t="wifi">WiFi</button>
+  <button data-t="net">Internet</button>
+  <button data-t="sys">System</button>
+</nav>
+
+<section id="status" class="on">
+  <h2>Connection</h2>
+  <dl>
+    <dt>State</dt><dd id="s_state">—</dd>
+    <dt>WAN IP</dt><dd id="s_ip">—</dd>
+    <dt>Gateway</dt><dd id="s_gw">—</dd>
+    <dt>DNS</dt><dd id="s_dns">—</dd>
+    <dt>Operator</dt><dd id="s_op">—</dd>
+    <dt>Signal</dt><dd id="s_rssi">—</dd>
+    <dt>LAN IP</dt><dd id="s_lan">—</dd>
+    <dt>Clients</dt><dd id="s_cl">—</dd>
+    <dt>Uptime</dt><dd id="s_up">—</dd>
+    <dt>Free heap</dt><dd id="s_heap">—</dd>
+  </dl>
+</section>
+
+<section id="wifi">
+  <h2>Access point</h2>
+  <label>Network name (SSID)<input id="wifi_ssid" maxlength="32"></label>
+  <label>Password<input id="wifi_pass" type="password" maxlength="63" placeholder="8-63 characters"></label>
+  <p class="hint">Leave the password empty for an open network (not recommended).</p>
+  <div class="row">
+    <label>Channel<select id="wifi_ch"></select></label>
+    <label>Max clients<input id="wifi_max" type="number" min="1" max="10"></label>
+  </div>
+  <div class="chk"><input id="wifi_hidden" type="checkbox"><span>Hide SSID from scans</span></div>
+  <h2>LAN</h2>
+  <div class="row">
+    <label>Router IP<input id="ap_ip"></label>
+    <label>Netmask<input id="ap_netmask"></label>
+  </div>
+  <button class="act" onclick="save('wifi')">Save &amp; reboot</button>
+  <div id="m_wifi" class="msg"></div>
+</section>
+
+<section id="net">
+  <h2>Cellular</h2>
+  <label>APN<input id="apn" maxlength="64"></label>
+  <p class="hint">Indonesia: Telkomsel <code>internet</code> · Indosat <code>indosatgprs</code> · XL <code>xlgprs</code> · Tri <code>3gprs</code> · Smartfren <code>smart</code></p>
+  <div class="row">
+    <label>PPP username<input id="ppp_user" maxlength="32" placeholder="usually empty"></label>
+    <label>PPP password<input id="ppp_pass" type="password" maxlength="32" placeholder="usually empty"></label>
+  </div>
+  <label>SIM PIN<input id="sim_pin" maxlength="8" placeholder="empty if disabled"></label>
+  <button class="act" onclick="save('net')">Save &amp; reboot</button>
+  <div id="m_net" class="msg"></div>
+</section>
+
+<section id="sys">
+  <h2>Admin login</h2>
+  <label>Username<input id="admin_user" maxlength="16"></label>
+  <label>New password<input id="admin_pass" type="password" maxlength="32" placeholder="leave blank to keep current"></label>
+  <button class="act" onclick="save('sys')">Save &amp; reboot</button>
+  <div id="m_sys" class="msg"></div>
+  <h2 style="margin-top:22px">Maintenance</h2>
+  <button class="act" style="margin-bottom:10px" onclick="post('/api/reboot','Rebooting…')">Reboot</button>
+  <button class="act danger" onclick="factory()">Factory reset</button>
+  <div id="m_maint" class="msg"></div>
+</section>
+</main>
+
+<script>
+const $ = id => document.getElementById(id);
+const FIELDS = {
+  wifi: ['wifi_ssid','wifi_pass','wifi_ch','wifi_max','wifi_hidden','ap_ip','ap_netmask'],
+  net:  ['apn','ppp_user','ppp_pass','sim_pin'],
+  sys:  ['admin_user','admin_pass']
+};
+
+for (let c = 1; c <= 13; c++) {
+  $('wifi_ch').add(new Option(c, c));
+}
+
+document.querySelectorAll('nav button').forEach(b => b.onclick = () => {
+  document.querySelectorAll('nav button').forEach(x => x.classList.toggle('on', x === b));
+  document.querySelectorAll('section').forEach(s => s.classList.toggle('on', s.id === b.dataset.t));
+});
+
+function msg(tab, text, ok) {
+  const el = $('m_' + tab);
+  el.textContent = text;
+  el.className = 'msg ' + (ok ? 'ok' : 'err');
+}
+
+async function load() {
+  const c = await (await fetch('/api/config')).json();
+  for (const k in c) {
+    const el = $(k);
+    if (!el) continue;
+    if (el.type === 'checkbox') el.checked = !!c[k]; else el.value = c[k];
+  }
+}
+
+function fmtUptime(s) {
+  const d = Math.floor(s / 86400), h = Math.floor(s % 86400 / 3600),
+        m = Math.floor(s % 3600 / 60);
+  return (d ? d + 'd ' : '') + (h || d ? h + 'h ' : '') + m + 'm';
+}
+
+async function refresh() {
+  try {
+    const s = await (await fetch('/api/status')).json();
+    $('badge').textContent = s.wan_up ? 'Online' : 'Offline';
+    $('badge').className = 'pill ' + (s.wan_up ? 'up' : 'down');
+    $('s_state').textContent = s.state;
+    $('s_ip').textContent  = s.wan_ip  || '—';
+    $('s_gw').textContent  = s.wan_gw  || '—';
+    $('s_dns').textContent = s.wan_dns || '—';
+    $('s_op').textContent  = s.operator || '—';
+    // AT+CSQ reports 0..31 in 2 dBm steps from -113 dBm; 99 means unknown.
+    $('s_rssi').textContent = (s.rssi >= 0 && s.rssi <= 31)
+      ? (-113 + 2 * s.rssi) + ' dBm' : 'unknown';
+    $('s_lan').textContent = s.lan_ip;
+    $('s_cl').textContent  = s.clients;
+    $('s_up').textContent  = fmtUptime(s.uptime_s);
+    $('s_heap').textContent = Math.round(s.heap_free / 1024) + ' KB (min ' +
+                              Math.round(s.heap_min / 1024) + ' KB)';
+  } catch (e) { /* the board is probably rebooting */ }
+}
+
+async function save(tab) {
+  const body = { reboot: true };
+  for (const k of FIELDS[tab]) {
+    const el = $(k);
+    if (el.type === 'checkbox')      body[k] = el.checked;
+    else if (el.type === 'number' || el.tagName === 'SELECT') body[k] = +el.value;
+    else                             body[k] = el.value;
+  }
+  // Blank means "keep the stored password" — never send it as an empty string.
+  if (body.admin_pass === '') delete body.admin_pass;
+
+  try {
+    const r = await fetch('/api/config', {
+      method: 'POST', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify(body)
+    });
+    const j = await r.json();
+    if (r.ok) msg(tab, 'Saved. Rebooting — reconnect to the WiFi network in a few seconds.', true);
+    else      msg(tab, j.error || 'Save failed', false);
+  } catch (e) { msg(tab, 'Network error: ' + e.message, false); }
+}
+
+async function post(url, note) {
+  try {
+    const r = await fetch(url, { method: 'POST' });
+    msg('maint', r.ok ? note : 'Request failed', r.ok);
+  } catch (e) { msg('maint', 'Network error: ' + e.message, false); }
+}
+
+function factory() {
+  if (confirm('Erase all settings and reboot with factory defaults?')) {
+    post('/api/factory-reset', 'Erased. Rebooting with factory defaults.');
+  }
+}
+
+load();
+refresh();
+setInterval(refresh, 5000);
+</script>
+</body>
+</html>

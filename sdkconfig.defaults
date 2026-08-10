@@ -9,14 +9,47 @@ CONFIG_LWIP_PPP_SUPPORT=y
 CONFIG_LWIP_IP_FORWARD=y
 CONFIG_LWIP_IPV4_NAPT=y
 
+# Mandatory for NAPT: WiFi RX frames are zero-copy by default and cannot be
+# rewritten in place. Without this, forwarded client packets are silently
+# dropped and WiFi clients get no internet even though PPP is up.
+CONFIG_LWIP_L2_TO_L3_COPY=y
+
 # WiFi RX buffers
 CONFIG_ESP_WIFI_STATIC_RX_BUFFER_NUM=10
 CONFIG_ESP_WIFI_DYNAMIC_RX_BUFFER_NUM=32
 
-# lwIP TCPIP task — larger mailbox prevents pppos_input_tcpip ERR_MEM (-1) drops
-# when 4G bursts data faster than the TCPIP thread can drain the queue
-CONFIG_LWIP_TCPIP_RECVMBOX_SIZE=128
-CONFIG_LWIP_TCPIP_TASK_STACK_SIZE=4096
+# lwIP TCPIP task mailbox. This really is the resource that runs out: with
+# MEMP_MEM_MALLOC=1 the memp count limits are ignored and the heap stays at
+# ~187 KB free during the flood, so sys_mbox_trypost() is the only thing left
+# that can return ERR_MEM.
+#
+# The TCPIP thread serialises PPP transmit and receive, and a PPP write blocks
+# on the 115200 UART, so the mailbox has to absorb everything that arrives
+# during a transmit stall. 64 is not enough.
+#
+# The 6..64 Kconfig range only lifts to 6..1024 when LWIP_WND_SCALE is on, and
+# that in turn depends on SPIRAM_TRY_ALLOCATE_WIFI_LWIP.
+CONFIG_SPIRAM_TRY_ALLOCATE_WIFI_LWIP=y
+CONFIG_LWIP_WND_SCALE=y
+CONFIG_LWIP_TCP_RCV_SCALE=2
+CONFIG_LWIP_TCPIP_RECVMBOX_SIZE=256
+
+# The WiFi task is pinned to CPU0. Put the TCPIP thread on CPU1 so a PPP write
+# stalling on the UART does not also compete with WiFi for CPU0.
+CONFIG_LWIP_TCPIP_TASK_AFFINITY_CPU1=y
+CONFIG_LWIP_TCPIP_TASK_STACK_SIZE=6144
 
 # Watchdog timeout — modem boot can take several seconds
 CONFIG_ESP_TASK_WDT_TIMEOUT_S=30
+
+# 3 MB app partition — the 1 MB default cannot hold the firmware plus the
+# esp_modem debug strings below.
+CONFIG_PARTITION_TABLE_CUSTOM=y
+CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions.csv"
+
+# Modem UART hexdumps. Off now that bring-up is reliable — they cost flash and
+# the DEBUG log level compiles debug strings in across all of IDF.
+# To debug the modem link again, re-enable both and raise the "uart-tx" and
+# "uart-rx" tags with esp_log_level_set().
+# CONFIG_ESP_MODEM_ADD_DEBUG_LOGS=y
+# CONFIG_LOG_MAXIMUM_LEVEL_DEBUG=y

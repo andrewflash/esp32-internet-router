@@ -1,0 +1,7 @@
+# Single-app layout for the 16 MB flash on the T-Internet-COM.
+# The IDF default gives the app only 1 MB, which this firmware nearly fills
+# (~88%) and cannot fit with debug logging compiled in.
+# Name,   Type, SubType, Offset,   Size
+nvs,      data, nvs,     0x9000,   0x6000
+phy_init, data, phy,     0xf000,   0x1000
+factory,  app,  factory, 0x10000,  0x300000
