@@ -199,8 +199,8 @@ static void ppp_start(void)
     dte_cfg.uart_config.rts_io_num     = -1;
     dte_cfg.uart_config.cts_io_num     = -1;
     dte_cfg.uart_config.baud_rate      = 115200;
-    dte_cfg.uart_config.rx_buffer_size = 4096;  /* smaller burst = fewer ERR_MEM drops */
-    dte_cfg.uart_config.tx_buffer_size = 1024;
+    dte_cfg.uart_config.rx_buffer_size = 1536;  /* ~1 PPP frame; DTE posts one frame at a time so TCPIP can drain between reads */
+    dte_cfg.uart_config.tx_buffer_size = 512;
     dte_cfg.task_stack_size            = 4096;
     dte_cfg.task_priority              = 5;
 
