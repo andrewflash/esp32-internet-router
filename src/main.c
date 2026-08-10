@@ -22,6 +22,7 @@
 #include "esp_netif.h"
 #include "nvs_flash.h"
 #include "driver/gpio.h"
+#include "esp_mac.h"
 #include "esp_modem_api.h"
 #include "lwip/lwip_napt.h"         /* ip_napt_enable() — needs CONFIG_LWIP_IPV4_NAPT=y */
 
@@ -138,12 +139,16 @@ static void on_wifi_event(void *arg, esp_event_base_t base,
     if (id == WIFI_EVENT_AP_STACONNECTED) {
         wifi_event_ap_staconnected_t *ev = data;
         char mac[18];
-        snprintf(mac, sizeof(mac), "%02x:%02x:%02x:%02x:%02x:%02x", MAC2STR(ev->mac));
+        snprintf(mac, sizeof(mac), "%02x:%02x:%02x:%02x:%02x:%02x",
+                 (unsigned)ev->mac[0], (unsigned)ev->mac[1], (unsigned)ev->mac[2],
+                 (unsigned)ev->mac[3], (unsigned)ev->mac[4], (unsigned)ev->mac[5]);
         ESP_LOGI(TAG, "Client joined  MAC=%s  AID=%d", mac, ev->aid);
     } else if (id == WIFI_EVENT_AP_STADISCONNECTED) {
         wifi_event_ap_stadisconnected_t *ev = data;
         char mac[18];
-        snprintf(mac, sizeof(mac), "%02x:%02x:%02x:%02x:%02x:%02x", MAC2STR(ev->mac));
+        snprintf(mac, sizeof(mac), "%02x:%02x:%02x:%02x:%02x:%02x",
+                 (unsigned)ev->mac[0], (unsigned)ev->mac[1], (unsigned)ev->mac[2],
+                 (unsigned)ev->mac[3], (unsigned)ev->mac[4], (unsigned)ev->mac[5]);
         ESP_LOGI(TAG, "Client left    MAC=%s  AID=%d", mac, ev->aid);
     }
 }
