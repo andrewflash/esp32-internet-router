@@ -72,15 +72,28 @@ reaches the chip.
 | --- | --- | --- |
 | PCIE-TX | 33 | ESP32 UART1 TX → modem RX |
 | PCIE-RX | 35 | modem TX → ESP32 UART1 RX (input-only pin, fine for RX) |
-| PCIE-RST | 32 | present on the schematic, but pulsing it does **not** reset this module |
+| PWRKEY | 32 | modem power control, **asserted HIGH** — see below |
 
+* **GPIO32 is PWRKEY, not a reset.** The board pinout image labels it
+  "PCIE-RST", which is misleading: LilyGo's own examples define it as
+  `MODEM_PWRKEY`, and it is asserted by driving the ESP32 pin **HIGH** (the
+  module's PWRKEY is pulled up to VBAT internally and triggers on a LOW, so
+  there is an inverting stage between the two). A LOW pulse asserts nothing at
+  all. Per the [A7672X/A7670X hardware design][hw] §3.2, the module needs
+  ~50 ms asserted to power **on** and **≥2.5 s** to power **off** — a short
+  pulse on a running module is ignored by design.
+* **A silent modem is usually still in PPP data mode** from a previous run — an
+  ESP32 reset does not touch it. Bring-up escalates: AT sync with a `+++`
+  escape → PWRKEY power-on pulse → full PWRKEY power cycle. `AT+CRESET` and
+  `AT+CPOF` are only useful while the modem still answers AT; the power cycle
+  is the only recovery that reaches a wedged module. Do not cut the modem's
+  VBAT to force the issue — SIMCom warns it can corrupt the module's flash.
 * **Baud is fixed at 115200.** `AT+IPR=460800` was tried: the modem did not
   follow, the link filled with framing garbage, and it needed a power-cycle.
   The Mini-PCIE slot has no RTS/CTS to make a faster rate reliable, so WAN
   throughput tops out around 11 kB/s.
-* **A silent modem is usually still in PPP data mode** from a previous run — an
-  ESP32 reset does not touch it. The firmware probes for that and sends the
-  `+++` escape before falling back to `AT+CRESET`.
+
+[hw]: https://files.waveshare.com/wiki/A7670E-Cat-1-GNSS-HAT/A7672X_A7670X_Series_Hardware_Design_V1.03.pdf
 * The `sdkconfig.defaults` comments explain the lwIP tuning (TCPIP mailbox size,
   UART ring sizes) that fixed the `pppos_input_tcpip ERR_MEM` flood. Read them
   before changing those values.

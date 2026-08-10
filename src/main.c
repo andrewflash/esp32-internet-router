@@ -7,8 +7,7 @@
  * Board pins (from T-Internet-COM schematic):
  *   PCIE-TX  = GPIO33  (ESP32 UART TX → Modem RX)
  *   PCIE-RX  = GPIO35  (Modem TX → ESP32 UART RX, input-only GPIO — fine for UART RX)
- *   PCIE-RST = GPIO32  (Modem hardware reset, active LOW)
- *   No dedicated PWRKEY GPIO; modem powers via Mini PCIE 3.8 V rail.
+ *   GPIO32   = Modem PWRKEY, asserted HIGH (see the note at MODEM_PWRKEY below)
  *
  * SSID, password, APN and the rest are stored in NVS and edited from the web UI
  * at the SoftAP address — see router_config.h for the factory defaults.
@@ -42,14 +41,34 @@
 #define MODEM_UART_RX   35
 #define MODEM_UART_PORT UART_NUM_1
 
+/*
+ * GPIO32 is PWRKEY, not a reset line — the board pinout image calls it
+ * "PCIE-RST", but every LilyGo T-Internet-COM example defines it as
+ * MODEM_PWRKEY, and there is no other modem control GPIO on this board.
+ *
+ * It is asserted by driving the ESP32 pin HIGH: the A7670E's PWRKEY is
+ * internally pulled up to VBAT and triggers on a LOW, so an inverting stage
+ * sits between the two. Driving it LOW asserts nothing at all, which is why
+ * earlier "reset pulses" here appeared to do nothing whatsoever.
+ */
+#define MODEM_PWRKEY    32
+#define PWRKEY_ASSERT   1
+#define PWRKEY_RELEASE  0
+
 /* Fixed. AT+IPR=460800 was tried and the modem did not follow: the link filled
  * with Rx Break and framing garbage, and it then needed a power-cycle. There is
  * no RTS/CTS on the Mini PCIE slot to make a higher rate reliable, so 115200 is
- * the supported rate and the WAN ceiling is ~11 kB/s.
- * PCIE-RST (GPIO32) is unused: pulsing it does not reset this module. */
+ * the supported rate and the WAN ceiling is ~11 kB/s. */
 #define MODEM_BAUD_INIT 115200
 
 /* ── Timing ──────────────────────────────────────────────────── */
+/* From A7672X/A7670X Series Hardware Design V1.03 §3.2. The module measures
+ * these at its own pin; the numbers below add margin on top of the minimums. */
+#define PWRKEY_ON_MS        300     /* ≥50 ms typ. to power on */
+#define PWRKEY_OFF_MS       3000    /* ≥2.5 s to power off — a short pulse is ignored */
+#define MODEM_OFF_ON_GAP_MS 1500    /* Toff-on buffer; the datasheet leaves it blank */
+#define MODEM_UART_READY_MS 9000    /* UART ready ~8 s after power-on (STATUS high ~7 s) */
+
 #define MODEM_BOOT_MS       10000   /* wait after AT+CRESET before retrying AT */
 #define MODEM_SYNC_MS       30000   /* max time to get an "OK" back from AT */
 #define MODEM_REG_MS        60000   /* max time to attach to the network */
@@ -248,6 +267,57 @@ static void wifi_ap_start(const router_config_t *cfg)
              cfg->wifi_pass[0] ? "WPA2" : "OPEN");
 }
 
+/* ── Modem power control (PWRKEY) ────────────────────────────── */
+
+static void modem_pwrkey_init(void)
+{
+    gpio_config_t io = {
+        .pin_bit_mask = 1ULL << MODEM_PWRKEY,
+        .mode         = GPIO_MODE_OUTPUT,
+        .pull_up_en   = GPIO_PULLUP_DISABLE,
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,
+        .intr_type    = GPIO_INTR_DISABLE,
+    };
+    ESP_ERROR_CHECK(gpio_config(&io));
+    gpio_set_level(MODEM_PWRKEY, PWRKEY_RELEASE);
+}
+
+static void modem_pwrkey_pulse(int assert_ms)
+{
+    gpio_set_level(MODEM_PWRKEY, PWRKEY_ASSERT);
+    vTaskDelay(pdMS_TO_TICKS(assert_ms));
+    gpio_set_level(MODEM_PWRKEY, PWRKEY_RELEASE);
+}
+
+/*
+ * Power-on pulse. Harmless on a module that is already running: powering off
+ * needs the PWRKEY held for 2.5 s, so this shorter pulse is ignored.
+ */
+static void modem_power_on(void)
+{
+    ESP_LOGI(TAG, "PWRKEY power-on pulse (%d ms)", PWRKEY_ON_MS);
+    modem_pwrkey_pulse(PWRKEY_ON_MS);
+    vTaskDelay(pdMS_TO_TICKS(MODEM_UART_READY_MS));
+}
+
+/*
+ * The only recovery that works on a modem which has stopped answering AT.
+ * AT+CRESET and AT+CPOF both need a responsive modem, and rebooting the ESP32
+ * does not touch the module's power at all.
+ *
+ * SIMCom warns against cutting VBAT on a running module (it can corrupt flash);
+ * the PWRKEY long-press is the sanctioned way to do this from firmware.
+ */
+static void modem_power_cycle(void)
+{
+    ESP_LOGW(TAG, "Power-cycling modem via PWRKEY (off %d ms, on %d ms)",
+             PWRKEY_OFF_MS, PWRKEY_ON_MS);
+
+    modem_pwrkey_pulse(PWRKEY_OFF_MS);
+    vTaskDelay(pdMS_TO_TICKS(MODEM_OFF_ON_GAP_MS));
+    modem_power_on();
+}
+
 /* ── Modem / PPP ─────────────────────────────────────────────── */
 
 /*
@@ -309,9 +379,12 @@ static bool modem_reset_via_at(void)
 }
 
 /*
- * Normal path: the modem is already powered and usually already answering, so
- * poll rather than blindly waiting out a boot delay. Escalate to AT+CRESET only
- * if plain sync and the stale-PPP escape both fail.
+ * Escalating bring-up, cheapest first. The modem is normally already powered
+ * and answering, so the common case costs one AT round-trip:
+ *
+ *   1. plain AT sync, with the "+++" stale-PPP escape folded in
+ *   2. PWRKEY power-on pulse — covers a module that is simply off
+ *   3. full PWRKEY power cycle — the only thing that reaches a wedged module
  */
 static bool modem_bring_up(void)
 {
@@ -319,13 +392,22 @@ static bool modem_bring_up(void)
         return true;
     }
 
-    ESP_LOGW(TAG, "Modem silent after %d ms — attempting AT reset", MODEM_SYNC_MS);
-    if (modem_reset_via_at()) {
+    ESP_LOGW(TAG, "Modem silent after %d ms — sending power-on pulse", MODEM_SYNC_MS);
+    status_set_state("powering on modem");
+    modem_power_on();
+    if (modem_wait_at_ready(MODEM_SYNC_MS)) {
         return true;
     }
 
-    ESP_LOGE(TAG, "Modem unreachable. PCIE-RST does not reset this module and "
-                  "AT+CRESET needs a responsive modem — power-cycle the board.");
+    ESP_LOGW(TAG, "Still silent — power-cycling the modem");
+    status_set_state("power-cycling modem");
+    modem_power_cycle();
+    if (modem_wait_at_ready(MODEM_SYNC_MS)) {
+        return true;
+    }
+
+    ESP_LOGE(TAG, "Modem unreachable even after a PWRKEY power cycle — "
+                  "check the SIM, the antenna and the 3.8 V rail.");
     return false;
 }
 
@@ -473,6 +555,7 @@ static void wan_task(void *arg)
 {
     const router_config_t *cfg = router_config_get();
 
+    modem_pwrkey_init();
     modem_create(cfg);
 
     while (1) {
@@ -495,9 +578,15 @@ static void wan_task(void *arg)
         status_set_state("dialling");
         ESP_LOGI(TAG, "Starting PPP ...");
         if (!modem_enter_data_mode()) {
+            /* AT+CRESET is gentler and keeps the ~10 s power-on wait off the
+             * table, so try it first; fall back to PWRKEY when the modem has
+             * stopped answering AT altogether. */
             ESP_LOGW(TAG, "Dial failed — resetting modem");
             status_set_state("dial failed");
-            modem_reset_via_at();
+            if (!modem_reset_via_at()) {
+                status_set_state("power-cycling modem");
+                modem_power_cycle();
+            }
             continue;
         }
 
