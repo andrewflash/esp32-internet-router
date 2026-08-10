@@ -199,8 +199,8 @@ static void ppp_start(void)
     dte_cfg.uart_config.rts_io_num     = -1;
     dte_cfg.uart_config.cts_io_num     = -1;
     dte_cfg.uart_config.baud_rate      = 115200;
-    dte_cfg.uart_config.rx_buffer_size = 16384;
-    dte_cfg.uart_config.tx_buffer_size = 2048;
+    dte_cfg.uart_config.rx_buffer_size = 4096;  /* smaller burst = fewer ERR_MEM drops */
+    dte_cfg.uart_config.tx_buffer_size = 1024;
     dte_cfg.task_stack_size            = 4096;
     dte_cfg.task_priority              = 5;
 

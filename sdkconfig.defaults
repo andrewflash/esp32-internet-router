@@ -13,5 +13,10 @@ CONFIG_LWIP_IPV4_NAPT=y
 CONFIG_ESP_WIFI_STATIC_RX_BUFFER_NUM=10
 CONFIG_ESP_WIFI_DYNAMIC_RX_BUFFER_NUM=32
 
+# lwIP TCPIP task — larger mailbox prevents pppos_input_tcpip ERR_MEM (-1) drops
+# when 4G bursts data faster than the TCPIP thread can drain the queue
+CONFIG_LWIP_TCPIP_RECVMBOX_SIZE=64
+CONFIG_LWIP_TCPIP_TASK_STACK_SIZE=4096
+
 # Watchdog timeout — modem boot can take several seconds
 CONFIG_ESP_TASK_WDT_TIMEOUT_S=30
