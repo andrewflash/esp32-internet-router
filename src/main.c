@@ -82,18 +82,21 @@ static void ap_dhcps_set_dns(esp_netif_t *ap_netif, uint32_t dns_addr)
 {
     esp_netif_dhcps_stop(ap_netif);
 
-    dhcps_offer_t opt = OFFER_DNS;
+    /* OFFER_DNS = 0x02 from dhcpserver.h; use raw value to avoid internal header */
+    uint8_t offer_dns = 0x02;
     ESP_ERROR_CHECK(esp_netif_dhcps_option(ap_netif,
                                            ESP_NETIF_OP_SET,
                                            ESP_NETIF_DOMAIN_NAME_SERVER,
-                                           &opt, sizeof(opt)));
+                                           &offer_dns, sizeof(offer_dns)));
 
     esp_netif_dns_info_t dns = { .ip = { .type = ESP_IPADDR_TYPE_V4 } };
     dns.ip.u_addr.ip4.addr = dns_addr;
     ESP_ERROR_CHECK(esp_netif_set_dns_info(ap_netif, ESP_NETIF_DNS_MAIN, &dns));
 
     esp_netif_dhcps_start(ap_netif);
-    ESP_LOGI(TAG, "DHCP-DNS set to " IPSTR, IP2STR((ip4_addr_t *)&dns_addr));
+    char dns_s[16];
+    snprintf(dns_s, sizeof(dns_s), IPSTR, IP2STR((ip4_addr_t *)&dns_addr));
+    ESP_LOGI(TAG, "DHCP-DNS set to %s", dns_s);
 }
 
 /* ── Event handlers ──────────────────────────────────────────── */
@@ -105,13 +108,15 @@ static void on_ip_event(void *arg, esp_event_base_t base,
 
     if (id == IP_EVENT_PPP_GOT_IP) {
         ip_event_got_ip_t *ev = data;
-        ESP_LOGI(TAG, "PPP connected");
-        ESP_LOGI(TAG, "  IP      : " IPSTR, IP2STR(&ev->ip_info.ip));
-        ESP_LOGI(TAG, "  Gateway : " IPSTR, IP2STR(&ev->ip_info.gw));
+        char ip_s[16], gw_s[16], dns_s[16];
+        snprintf(ip_s, sizeof(ip_s), IPSTR, IP2STR(&ev->ip_info.ip));
+        snprintf(gw_s, sizeof(gw_s), IPSTR, IP2STR(&ev->ip_info.gw));
 
         esp_netif_dns_info_t dns;
         esp_netif_get_dns_info(ev->esp_netif, ESP_NETIF_DNS_MAIN, &dns);
-        ESP_LOGI(TAG, "  DNS     : " IPSTR, IP2STR(&dns.ip.u_addr.ip4));
+        snprintf(dns_s, sizeof(dns_s), IPSTR, IP2STR(&dns.ip.u_addr.ip4));
+
+        ESP_LOGI(TAG, "PPP connected  IP=%s  GW=%s  DNS=%s", ip_s, gw_s, dns_s);
 
         /* Forward carrier DNS to WiFi clients */
         if (s_ap_netif) {
@@ -128,15 +133,18 @@ static void on_ip_event(void *arg, esp_event_base_t base,
 static void on_wifi_event(void *arg, esp_event_base_t base,
                           int32_t id, void *data)
 {
+    /* MACSTR/MAC2STR cause preprocessor errors inside IDF 6.x multi-branch
+     * ESP_LOG_LEVEL macro. Format MAC into a buffer first. */
     if (id == WIFI_EVENT_AP_STACONNECTED) {
         wifi_event_ap_staconnected_t *ev = data;
-        ESP_LOGI(TAG, "Client joined  MAC=" MACSTR "  AID=%d  total=%d",
-                 MAC2STR(ev->mac), ev->aid,
-                 esp_wifi_ap_get_sta_list(NULL) == ESP_OK ? 0 : 0);
+        char mac[18];
+        snprintf(mac, sizeof(mac), "%02x:%02x:%02x:%02x:%02x:%02x", MAC2STR(ev->mac));
+        ESP_LOGI(TAG, "Client joined  MAC=%s  AID=%d", mac, ev->aid);
     } else if (id == WIFI_EVENT_AP_STADISCONNECTED) {
         wifi_event_ap_stadisconnected_t *ev = data;
-        ESP_LOGI(TAG, "Client left    MAC=" MACSTR "  AID=%d",
-                 MAC2STR(ev->mac), ev->aid);
+        char mac[18];
+        snprintf(mac, sizeof(mac), "%02x:%02x:%02x:%02x:%02x:%02x", MAC2STR(ev->mac));
+        ESP_LOGI(TAG, "Client left    MAC=%s  AID=%d", mac, ev->aid);
     }
 }
 
