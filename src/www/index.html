@@ -57,6 +57,7 @@ dt{color:var(--mut)}dd{margin:0;text-align:right;font-variant-numeric:tabular-nu
     <dt>LAN IP</dt><dd id="s_lan">—</dd>
     <dt>Clients</dt><dd id="s_cl">—</dd>
     <dt>Uptime</dt><dd id="s_up">—</dd>
+    <dt>Last reset</dt><dd id="s_reset">—</dd>
     <dt>Free heap</dt><dd id="s_heap">—</dd>
   </dl>
 </section>
@@ -67,7 +68,7 @@ dt{color:var(--mut)}dd{margin:0;text-align:right;font-variant-numeric:tabular-nu
   <label>Password<input id="wifi_pass" type="password" maxlength="63" placeholder="8-63 characters"></label>
   <p class="hint">Leave the password empty for an open network (not recommended).</p>
   <div class="row">
-    <label>Channel<select id="wifi_ch"></select></label>
+    <label>Channel<select id="wifi_ch"></select><span class="hint">Channels 1-11 maximize client compatibility.</span></label>
     <label>Max clients<input id="wifi_max" type="number" min="1" max="10"></label>
   </div>
   <div class="chk"><input id="wifi_hidden" type="checkbox"><span>Hide SSID from scans</span></div>
@@ -114,7 +115,7 @@ const FIELDS = {
   sys:  ['admin_user','admin_pass']
 };
 
-for (let c = 1; c <= 13; c++) {
+for (let c = 1; c <= 11; c++) {
   $('wifi_ch').add(new Option(c, c));
 }
 
@@ -160,6 +161,7 @@ async function refresh() {
     $('s_lan').textContent = s.lan_ip;
     $('s_cl').textContent  = s.clients;
     $('s_up').textContent  = fmtUptime(s.uptime_s);
+    $('s_reset').textContent = s.reset_reason || 'unknown';
     $('s_heap').textContent = Math.round(s.heap_free / 1024) + ' KB (min ' +
                               Math.round(s.heap_min / 1024) + ' KB)';
   } catch (e) { /* the board is probably rebooting */ }

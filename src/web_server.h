@@ -20,6 +20,7 @@ typedef struct {
     char     operator_name[40];
     char     modem_state[32];    /* short human-readable WAN phase */
     uint32_t uptime_s;
+    char     reset_reason[24];
     int      clients;
     uint32_t heap_free;
     uint32_t heap_min;

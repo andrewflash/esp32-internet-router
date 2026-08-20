@@ -15,9 +15,11 @@
 
 #include <stdio.h>
 #include <string.h>
+#include <errno.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/event_groups.h"
+#include "freertos/semphr.h"
 #include "esp_system.h"
 #include "esp_timer.h"
 #include "esp_heap_caps.h"
@@ -32,6 +34,7 @@
 #include "esp_mac.h"
 #include "esp_modem_api.h"
 #include "lwip/lwip_napt.h"         /* ip_napt_enable() — needs CONFIG_LWIP_IPV4_NAPT=y */
+#include "lwip/sockets.h"
 
 #include "router_config.h"
 #include "web_server.h"
@@ -76,6 +79,12 @@
 #define PPP_MODE_RETRIES    5       /* ATD*99# attempts before giving up */
 #define RECONNECT_DELAY_MS  3000    /* shorter gap: the outage is visible to clients */
 #define WAN_RETRY_DELAY_MS  15000   /* pause before restarting a failed bring-up */
+#define WAN_HEALTH_INTERVAL_MS 30000
+#define WAN_HEALTH_FAILURE_LIMIT 3
+#define WAN_STALL_TIMEOUT_MS 180000
+
+#define FALLBACK_DNS_MAIN   "1.1.1.1"
+#define FALLBACK_DNS_BACKUP "8.8.8.8"
 
 /* ── Event bits ──────────────────────────────────────────────── */
 #define BIT_PPP_GOT_IP  BIT0
@@ -84,23 +93,63 @@
 static const char *TAG = "4G-Router";
 
 static EventGroupHandle_t  s_event_group;
+static SemaphoreHandle_t   s_status_mutex;
+static TaskHandle_t        s_wan_task_handle;
 static esp_netif_t        *s_ppp_netif = NULL;
 static esp_netif_t        *s_ap_netif  = NULL;
 static esp_modem_dce_t    *s_dce       = NULL;
+static uint32_t            s_wan_dns_main;
+static uint32_t            s_wan_dns_backup;
+static uint32_t            s_ap_dns_main;
+static TickType_t          s_wan_heartbeat_tick;
+static router_config_t     s_wan_config;
 
-/* Status shown in the web UI. Written only by the WAN task and the IP event
- * handler; the reader takes a plain snapshot, which is good enough for a
- * status page. */
+/* Status is shared by the WAN task, event loop, HTTP task and app_main. */
 static router_status_t s_status = { .rssi = 99, .modem_state = "starting" };
+
+static void status_lock(void)
+{
+    xSemaphoreTake(s_status_mutex, portMAX_DELAY);
+}
+
+static void status_unlock(void)
+{
+    xSemaphoreGive(s_status_mutex);
+}
 
 static void status_set_state(const char *state)
 {
+    status_lock();
     strlcpy(s_status.modem_state, state, sizeof(s_status.modem_state));
+    status_unlock();
+}
+
+static void status_set_wan_up(bool up)
+{
+    status_lock();
+    s_status.wan_up = up;
+    status_unlock();
+}
+
+static void wan_heartbeat(void)
+{
+    status_lock();
+    s_wan_heartbeat_tick = xTaskGetTickCount();
+    status_unlock();
+}
+
+static void wan_delay(uint32_t delay_ms)
+{
+    wan_heartbeat();
+    vTaskDelay(pdMS_TO_TICKS(delay_ms));
+    wan_heartbeat();
 }
 
 void router_status_get(router_status_t *out)
 {
+    status_lock();
     *out = s_status;
+    status_unlock();
 
     out->uptime_s  = (uint32_t)(esp_timer_get_time() / 1000000);
     out->heap_free = (uint32_t)heap_caps_get_free_size(MALLOC_CAP_INTERNAL);
@@ -116,14 +165,12 @@ void router_status_get(router_status_t *out)
  * Quieten the components that log per-packet or per-association once the
  * router is running.
  *
- * "esp-netif_lwip-ppp" is set to NONE rather than WARN because the
- * pppos_input_tcpip ERR_MEM line is logged at ERROR level and would still come
- * through at WARN. Nothing is lost: PPP up/down still surfaces through our own
- * IP_EVENT handler as "PPP connected" / "PPP lost IP".
+ * Keep PPP errors visible: an ERR_MEM packet drop can kill the data plane
+ * without generating a PPP lost-IP event.
  */
 static void quiet_noisy_logs(void)
 {
-    esp_log_level_set("esp-netif_lwip-ppp", ESP_LOG_NONE);
+    esp_log_level_set("esp-netif_lwip-ppp", ESP_LOG_ERROR);
     esp_log_level_set("esp_modem_netif", ESP_LOG_WARN);
     esp_log_level_set("wifi", ESP_LOG_WARN);
     esp_log_level_set("wifi_init", ESP_LOG_WARN);
@@ -136,25 +183,94 @@ static void quiet_noisy_logs(void)
  * Push the carrier's DNS to the SoftAP DHCP server so WiFi clients
  * receive a working DNS server address automatically.
  */
-static void ap_dhcps_set_dns(esp_netif_t *ap_netif, uint32_t dns_addr)
+static uint32_t ipv4_addr_from_string(const char *text)
 {
-    esp_netif_dhcps_stop(ap_netif);
+    esp_ip4_addr_t addr = {0};
+    return esp_netif_str_to_ip4(text, &addr) == ESP_OK ? addr.addr : 0;
+}
+
+static bool dns_addr_usable(uint32_t addr)
+{
+    return addr != 0 && addr != UINT32_MAX;
+}
+
+/* Update the DHCP offer without allowing a transient DHCP error to abort the
+ * whole router. Existing stations are re-associated only when the advertised
+ * DNS actually changes, which makes them request an updated DHCP lease. */
+static esp_err_t ap_dhcps_set_dns(esp_netif_t *ap_netif, uint32_t main_addr,
+                                  uint32_t backup_addr, bool refresh_clients)
+{
+    if (!dns_addr_usable(main_addr)) {
+        main_addr = ipv4_addr_from_string(FALLBACK_DNS_MAIN);
+    }
+    if (!dns_addr_usable(backup_addr) || backup_addr == main_addr) {
+        backup_addr = ipv4_addr_from_string(FALLBACK_DNS_BACKUP);
+    }
+
+    bool changed = main_addr != s_ap_dns_main;
+    esp_err_t err = esp_netif_dhcps_stop(ap_netif);
+    if (err != ESP_OK && err != ESP_ERR_ESP_NETIF_DHCP_ALREADY_STOPPED) {
+        ESP_LOGE(TAG, "Could not stop DHCP server for DNS update: %s",
+                 esp_err_to_name(err));
+        return err;
+    }
 
     /* OFFER_DNS = 0x02 from dhcpserver.h; use raw value to avoid internal header */
     uint8_t offer_dns = 0x02;
-    ESP_ERROR_CHECK(esp_netif_dhcps_option(ap_netif,
-                                           ESP_NETIF_OP_SET,
-                                           ESP_NETIF_DOMAIN_NAME_SERVER,
-                                           &offer_dns, sizeof(offer_dns)));
+    err = esp_netif_dhcps_option(ap_netif, ESP_NETIF_OP_SET,
+                                 ESP_NETIF_DOMAIN_NAME_SERVER,
+                                 &offer_dns, sizeof(offer_dns));
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "Could not enable DHCP DNS option: %s", esp_err_to_name(err));
+        goto restart_dhcp;
+    }
 
     esp_netif_dns_info_t dns = { .ip = { .type = ESP_IPADDR_TYPE_V4 } };
-    dns.ip.u_addr.ip4.addr = dns_addr;
-    ESP_ERROR_CHECK(esp_netif_set_dns_info(ap_netif, ESP_NETIF_DNS_MAIN, &dns));
+    dns.ip.u_addr.ip4.addr = main_addr;
+    err = esp_netif_set_dns_info(ap_netif, ESP_NETIF_DNS_MAIN, &dns);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "Could not set main DHCP DNS: %s", esp_err_to_name(err));
+        goto restart_dhcp;
+    }
+    dns.ip.u_addr.ip4.addr = backup_addr;
+    err = esp_netif_set_dns_info(ap_netif, ESP_NETIF_DNS_BACKUP, &dns);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "Could not set backup DHCP DNS: %s", esp_err_to_name(err));
+        goto restart_dhcp;
+    }
 
-    esp_netif_dhcps_start(ap_netif);
-    char dns_s[16];
-    snprintf(dns_s, sizeof(dns_s), IPSTR, IP2STR((ip4_addr_t *)&dns_addr));
-    ESP_LOGI(TAG, "DHCP-DNS set to %s", dns_s);
+restart_dhcp:
+    {
+        esp_err_t start_err = esp_netif_dhcps_start(ap_netif);
+        if (start_err != ESP_OK && start_err != ESP_ERR_ESP_NETIF_DHCP_ALREADY_STARTED) {
+            ESP_LOGE(TAG, "Could not restart DHCP server: %s", esp_err_to_name(start_err));
+            return start_err;
+        }
+    }
+    if (err != ESP_OK) {
+        return err;
+    }
+
+    s_ap_dns_main = main_addr;
+    ip4_addr_t main_ip = { .addr = main_addr };
+    ip4_addr_t backup_ip = { .addr = backup_addr };
+    ESP_LOGI(TAG, "DHCP DNS set to " IPSTR " / " IPSTR,
+             IP2STR(&main_ip), IP2STR(&backup_ip));
+
+    if (changed && refresh_clients) {
+        wifi_sta_list_t stations;
+        if (esp_wifi_ap_get_sta_list(&stations) == ESP_OK && stations.num > 0) {
+            ESP_LOGW(TAG, "DNS changed; reconnecting %u client(s) for fresh DHCP leases",
+                     (unsigned)stations.num);
+            esp_err_t deauth_err = esp_wifi_deauth_sta(0);
+            if (deauth_err != ESP_OK) {
+                ESP_LOGW(TAG, "Could not reconnect WiFi clients: %s",
+                         esp_err_to_name(deauth_err));
+            }
+        }
+    }
+
+    return ESP_OK;
 }
 
 /* ── Event handlers ──────────────────────────────────────────── */
@@ -167,26 +283,46 @@ static void on_ip_event(void *arg, esp_event_base_t base,
     if (id == IP_EVENT_PPP_GOT_IP) {
         ip_event_got_ip_t *ev = data;
 
-        esp_netif_dns_info_t dns;
-        esp_netif_get_dns_info(ev->esp_netif, ESP_NETIF_DNS_MAIN, &dns);
-
-        snprintf(s_status.wan_ip,  sizeof(s_status.wan_ip),  IPSTR, IP2STR(&ev->ip_info.ip));
-        snprintf(s_status.wan_gw,  sizeof(s_status.wan_gw),  IPSTR, IP2STR(&ev->ip_info.gw));
-        snprintf(s_status.wan_dns, sizeof(s_status.wan_dns), IPSTR, IP2STR(&dns.ip.u_addr.ip4));
-
-        ESP_LOGI(TAG, "PPP connected  IP=%s  GW=%s  DNS=%s",
-                 s_status.wan_ip, s_status.wan_gw, s_status.wan_dns);
-
-        /* Forward carrier DNS to WiFi clients */
-        if (s_ap_netif) {
-            ap_dhcps_set_dns(s_ap_netif, dns.ip.u_addr.ip4.addr);
+        esp_netif_dns_info_t dns_main = {0};
+        esp_netif_dns_info_t dns_backup = {0};
+        if (esp_netif_get_dns_info(ev->esp_netif, ESP_NETIF_DNS_MAIN, &dns_main) != ESP_OK) {
+            dns_main.ip.u_addr.ip4.addr = 0;
         }
+        if (esp_netif_get_dns_info(ev->esp_netif, ESP_NETIF_DNS_BACKUP, &dns_backup) != ESP_OK) {
+            dns_backup.ip.u_addr.ip4.addr = 0;
+        }
+
+        uint32_t effective_dns = dns_addr_usable(dns_main.ip.u_addr.ip4.addr)
+                                     ? dns_main.ip.u_addr.ip4.addr
+                                     : (dns_addr_usable(dns_backup.ip.u_addr.ip4.addr)
+                                            ? dns_backup.ip.u_addr.ip4.addr
+                                            : ipv4_addr_from_string(FALLBACK_DNS_MAIN));
+        ip4_addr_t effective_dns_ip = { .addr = effective_dns };
+
+        char wan_ip[16];
+        char wan_gw[16];
+        char wan_dns[16];
+        snprintf(wan_ip, sizeof(wan_ip), IPSTR, IP2STR(&ev->ip_info.ip));
+        snprintf(wan_gw, sizeof(wan_gw), IPSTR, IP2STR(&ev->ip_info.gw));
+        snprintf(wan_dns, sizeof(wan_dns), IPSTR, IP2STR(&effective_dns_ip));
+
+        status_lock();
+        strlcpy(s_status.wan_ip, wan_ip, sizeof(s_status.wan_ip));
+        strlcpy(s_status.wan_gw, wan_gw, sizeof(s_status.wan_gw));
+        strlcpy(s_status.wan_dns, wan_dns, sizeof(s_status.wan_dns));
+        s_wan_dns_main = dns_main.ip.u_addr.ip4.addr;
+        s_wan_dns_backup = dns_backup.ip.u_addr.ip4.addr;
+        status_unlock();
+
+        ESP_LOGI(TAG, "PPP connected  IP=%s  GW=%s  DNS=%s", wan_ip, wan_gw, wan_dns);
 
         xEventGroupSetBits(s_event_group, BIT_PPP_GOT_IP);
     } else if (id == IP_EVENT_PPP_LOST_IP) {
         ESP_LOGW(TAG, "PPP lost IP");
+        status_lock();
         s_status.wan_up = false;
-        status_set_state("disconnected");
+        strlcpy(s_status.modem_state, "disconnected", sizeof(s_status.modem_state));
+        status_unlock();
         xEventGroupSetBits(s_event_group, BIT_PPP_LOST_IP);
     }
 }
@@ -209,7 +345,8 @@ static void on_wifi_event(void *arg, esp_event_base_t base,
         snprintf(mac, sizeof(mac), "%02x:%02x:%02x:%02x:%02x:%02x",
                  (unsigned)ev->mac[0], (unsigned)ev->mac[1], (unsigned)ev->mac[2],
                  (unsigned)ev->mac[3], (unsigned)ev->mac[4], (unsigned)ev->mac[5]);
-        ESP_LOGI(TAG, "Client left    MAC=%s  AID=%d", mac, ev->aid);
+        ESP_LOGI(TAG, "Client left    MAC=%s  AID=%d  reason=%u",
+                 mac, ev->aid, (unsigned)ev->reason);
     }
 }
 
@@ -217,19 +354,35 @@ static void on_wifi_event(void *arg, esp_event_base_t base,
 
 /* Move the AP off the 192.168.4.1 default if the user picked another subnet.
  * Must run before esp_wifi_start() so the DHCP server hands out the new pool. */
-static void ap_apply_static_ip(const router_config_t *cfg)
+static esp_err_t ap_apply_static_ip(const router_config_t *cfg)
 {
     esp_netif_ip_info_t ip_info = {0};
     if (esp_netif_str_to_ip4(cfg->ap_ip, &ip_info.ip) != ESP_OK ||
         esp_netif_str_to_ip4(cfg->ap_netmask, &ip_info.netmask) != ESP_OK) {
         ESP_LOGW(TAG, "Stored LAN address is invalid — keeping the default");
-        return;
+        return ESP_ERR_INVALID_ARG;
     }
     ip_info.gw = ip_info.ip;   /* the router is its own gateway for clients */
 
-    ESP_ERROR_CHECK(esp_netif_dhcps_stop(s_ap_netif));
-    ESP_ERROR_CHECK(esp_netif_set_ip_info(s_ap_netif, &ip_info));
-    ESP_ERROR_CHECK(esp_netif_dhcps_start(s_ap_netif));
+    esp_err_t err = esp_netif_dhcps_stop(s_ap_netif);
+    if (err != ESP_OK && err != ESP_ERR_ESP_NETIF_DHCP_ALREADY_STOPPED) {
+        ESP_LOGE(TAG, "Could not stop DHCP server for LAN update: %s",
+                 esp_err_to_name(err));
+        return err;
+    }
+
+    err = esp_netif_set_ip_info(s_ap_netif, &ip_info);
+    esp_err_t start_err = esp_netif_dhcps_start(s_ap_netif);
+    if (start_err != ESP_OK && start_err != ESP_ERR_ESP_NETIF_DHCP_ALREADY_STARTED) {
+        ESP_LOGE(TAG, "Could not start DHCP server after LAN update: %s",
+                 esp_err_to_name(start_err));
+        return start_err;
+    }
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "Could not apply LAN settings; default address remains: %s",
+                 esp_err_to_name(err));
+    }
+    return err;
 }
 
 static void wifi_ap_start(const router_config_t *cfg)
@@ -238,6 +391,15 @@ static void wifi_ap_start(const router_config_t *cfg)
     assert(s_ap_netif);
 
     ap_apply_static_ip(cfg);
+
+    esp_err_t dns_err = ap_dhcps_set_dns(s_ap_netif,
+                                         ipv4_addr_from_string(FALLBACK_DNS_MAIN),
+                                         ipv4_addr_from_string(FALLBACK_DNS_BACKUP),
+                                         false);
+    if (dns_err != ESP_OK) {
+        ESP_LOGW(TAG, "SoftAP is starting without explicit DNS: %s",
+                 esp_err_to_name(dns_err));
+    }
 
     wifi_init_config_t init_cfg = WIFI_INIT_CONFIG_DEFAULT();
     ESP_ERROR_CHECK(esp_wifi_init(&init_cfg));
@@ -285,7 +447,7 @@ static void modem_pwrkey_init(void)
 static void modem_pwrkey_pulse(int assert_ms)
 {
     gpio_set_level(MODEM_PWRKEY, PWRKEY_ASSERT);
-    vTaskDelay(pdMS_TO_TICKS(assert_ms));
+    wan_delay((uint32_t)assert_ms);
     gpio_set_level(MODEM_PWRKEY, PWRKEY_RELEASE);
 }
 
@@ -297,7 +459,7 @@ static void modem_power_on(void)
 {
     ESP_LOGI(TAG, "PWRKEY power-on pulse (%d ms)", PWRKEY_ON_MS);
     modem_pwrkey_pulse(PWRKEY_ON_MS);
-    vTaskDelay(pdMS_TO_TICKS(MODEM_UART_READY_MS));
+    wan_delay(MODEM_UART_READY_MS);
 }
 
 /*
@@ -314,7 +476,7 @@ static void modem_power_cycle(void)
              PWRKEY_OFF_MS, PWRKEY_ON_MS);
 
     modem_pwrkey_pulse(PWRKEY_OFF_MS);
-    vTaskDelay(pdMS_TO_TICKS(MODEM_OFF_ON_GAP_MS));
+    wan_delay(MODEM_OFF_ON_GAP_MS);
     modem_power_on();
 }
 
@@ -344,6 +506,7 @@ static bool modem_wait_at_ready(int timeout_ms)
     int round = 0;
 
     while (esp_timer_get_time() < deadline) {
+        wan_heartbeat();
         if (esp_modem_sync(s_dce) == ESP_OK) {
             ESP_LOGI(TAG, "Modem responds to AT");
             return true;
@@ -352,7 +515,7 @@ static bool modem_wait_at_ready(int timeout_ms)
         if (++round % 6 == 0) {
             modem_escape_stale_data_mode();
         }
-        vTaskDelay(pdMS_TO_TICKS(500));
+        wan_delay(500);
     }
     return false;
 }
@@ -374,7 +537,7 @@ static bool modem_reset_via_at(void)
     }
 
     ESP_LOGI(TAG, "Waiting %d ms for modem to come back ...", MODEM_BOOT_MS);
-    vTaskDelay(pdMS_TO_TICKS(MODEM_BOOT_MS));
+    wan_delay(MODEM_BOOT_MS);
     return modem_wait_at_ready(MODEM_SYNC_MS);
 }
 
@@ -427,12 +590,13 @@ static void modem_unlock_sim(const router_config_t *cfg)
         ESP_LOGE(TAG, "SIM PIN rejected — check the PIN in the web UI");
         return;
     }
-    vTaskDelay(pdMS_TO_TICKS(3000));
+    wan_delay(3000);
 }
 
-static void modem_read_operator(void)
+static void modem_read_operator(char *out, size_t out_len)
 {
     char resp[80];
+    out[0] = '\0';
     if (esp_modem_at(s_dce, "AT+COPS?", resp, 5000) != ESP_OK) {
         return;
     }
@@ -443,11 +607,11 @@ static void modem_read_operator(void)
     if (!close) return;
 
     size_t len = (size_t)(close - open - 1);
-    if (len >= sizeof(s_status.operator_name)) {
-        len = sizeof(s_status.operator_name) - 1;
+    if (len >= out_len) {
+        len = out_len - 1;
     }
-    memcpy(s_status.operator_name, open + 1, len);
-    s_status.operator_name[len] = '\0';
+    memcpy(out, open + 1, len);
+    out[len] = '\0';
 }
 
 static bool modem_wait_registered(void)
@@ -456,20 +620,27 @@ static bool modem_wait_registered(void)
     char reg[64];
 
     while (esp_timer_get_time() < deadline) {
+        wan_heartbeat();
         /* +CEREG: <n>,<stat> — stat 1 = home, 5 = roaming */
         if (esp_modem_at(s_dce, "AT+CEREG?", reg, 5000) == ESP_OK) {
             char *stat = strchr(reg, ',');
             if (stat && (stat[1] == '1' || stat[1] == '5')) {
                 int rssi = 99, ber = 0;
                 esp_modem_get_signal_quality(s_dce, &rssi, &ber);
+                char operator_name[sizeof(s_status.operator_name)];
+                modem_read_operator(operator_name, sizeof(operator_name));
+
+                status_lock();
                 s_status.rssi = rssi;
-                modem_read_operator();
+                strlcpy(s_status.operator_name, operator_name,
+                        sizeof(s_status.operator_name));
+                status_unlock();
                 ESP_LOGI(TAG, "Registered on network  RSSI=%d  operator=%s",
-                         rssi, s_status.operator_name);
+                         rssi, operator_name);
                 return true;
             }
         }
-        vTaskDelay(pdMS_TO_TICKS(1000));
+        wan_delay(1000);
     }
     ESP_LOGE(TAG, "Network registration timeout (%d ms)", MODEM_REG_MS);
     return false;
@@ -488,7 +659,7 @@ static bool modem_enter_data_mode(void)
 
         /* Drop back to command mode so the next dial starts from a known state */
         esp_modem_set_mode(s_dce, ESP_MODEM_MODE_COMMAND);
-        vTaskDelay(pdMS_TO_TICKS(2000));
+        wan_delay(2000);
         esp_modem_sync(s_dce);
     }
     return false;
@@ -528,41 +699,144 @@ static void modem_create(const router_config_t *cfg)
     /* Carriers that need PAP/CHAP credentials on the APN; most leave these
      * empty, in which case esp_modem skips authentication entirely. */
     if (cfg->ppp_user[0] || cfg->ppp_pass[0]) {
-        esp_netif_ppp_set_auth(s_ppp_netif, NETIF_PPP_AUTHTYPE_PAP,
-                               cfg->ppp_user, cfg->ppp_pass);
+        esp_netif_auth_type_t auth = (esp_netif_auth_type_t)(
+            NETIF_PPP_AUTHTYPE_PAP | NETIF_PPP_AUTHTYPE_CHAP);
+        esp_err_t auth_err = esp_netif_ppp_set_auth(s_ppp_netif, auth,
+                                                    cfg->ppp_user, cfg->ppp_pass);
+        if (auth_err != ESP_OK) {
+            ESP_LOGE(TAG, "Could not configure PPP authentication: %s",
+                     esp_err_to_name(auth_err));
+        }
     }
 }
 
 /* ── NAPT ────────────────────────────────────────────────────── */
 
-static void napt_enable(void)
+static bool napt_enable(void)
 {
     /* esp_netif_napt_enable() also flags the netif inside esp_netif, which
      * ip_napt_enable() alone does not do. */
-    ESP_ERROR_CHECK(esp_netif_napt_enable(s_ap_netif));
+    esp_err_t err = esp_netif_napt_enable(s_ap_netif);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "NAPT enable failed: %s", esp_err_to_name(err));
+        return false;
+    }
     ESP_LOGI(TAG, "NAPT enabled — WiFi→PPP routing active");
+    return true;
+}
+
+static void napt_disable(void)
+{
+    esp_err_t err = esp_netif_napt_disable(s_ap_netif);
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "NAPT disable failed: %s", esp_err_to_name(err));
+    }
+}
+
+/* Send a small DNS query over PPP. A valid response proves more than the PPP
+ * control state: routing, transmit, receive and one useful internet service all
+ * have to work. Any DNS response code counts as liveness. */
+static bool dns_probe_one(uint32_t dns_addr)
+{
+    if (!dns_addr_usable(dns_addr)) {
+        return false;
+    }
+
+    static uint16_t sequence;
+    uint16_t query_id = ++sequence;
+    uint8_t query[] = {
+        0x00, 0x00, 0x01, 0x00, 0x00, 0x01, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00,
+        0x07, 'e', 'x', 'a', 'm', 'p', 'l', 'e',
+        0x03, 'c', 'o', 'm', 0x00,
+        0x00, 0x01, 0x00, 0x01,
+    };
+    query[0] = (uint8_t)(query_id >> 8);
+    query[1] = (uint8_t)query_id;
+
+    int sock = lwip_socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+    if (sock < 0) {
+        ESP_LOGW(TAG, "WAN probe socket failed: errno=%d", errno);
+        return false;
+    }
+
+    struct timeval timeout = { .tv_sec = 1, .tv_usec = 500000 };
+    lwip_setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
+
+    struct sockaddr_in target = {
+        .sin_family = AF_INET,
+        .sin_port = htons(53),
+        .sin_addr.s_addr = dns_addr,
+    };
+    int sent = lwip_sendto(sock, query, sizeof(query), 0,
+                           (struct sockaddr *)&target, sizeof(target));
+    uint8_t response[96];
+    int received = sent == sizeof(query)
+                       ? lwip_recvfrom(sock, response, sizeof(response), 0, NULL, NULL)
+                       : -1;
+    lwip_close(sock);
+
+    return received >= 12 && response[0] == query[0] && response[1] == query[1] &&
+           (response[2] & 0x80) != 0;
+}
+
+static bool wan_data_plane_healthy(void)
+{
+    uint32_t main_dns;
+    uint32_t backup_dns;
+    status_lock();
+    main_dns = s_wan_dns_main;
+    backup_dns = s_wan_dns_backup;
+    status_unlock();
+
+    uint32_t candidates[] = {
+        main_dns,
+        backup_dns,
+        ipv4_addr_from_string(FALLBACK_DNS_MAIN),
+        ipv4_addr_from_string(FALLBACK_DNS_BACKUP),
+    };
+    for (size_t i = 0; i < sizeof(candidates) / sizeof(candidates[0]); i++) {
+        if (!dns_addr_usable(candidates[i])) {
+            continue;
+        }
+        bool duplicate = false;
+        for (size_t j = 0; j < i; j++) {
+            if (candidates[j] == candidates[i]) {
+                duplicate = true;
+                break;
+            }
+        }
+        if (!duplicate && dns_probe_one(candidates[i])) {
+            return true;
+        }
+    }
+    return false;
 }
 
 /* ── WAN task ────────────────────────────────────────────────── */
 
 /*
  * Owns the modem for the lifetime of the board: bring-up, dial, and redial
- * after a drop. It deliberately never reboots the ESP32 on failure — a reboot
- * does not touch the modem anyway, and it would take the config UI down with
- * it, which is exactly when the user needs to fix a wrong APN or SIM PIN.
+ * after a drop. Normal failures recover PPP or power-cycle only the modem so
+ * the config UI stays available. app_main restarts the ESP32 only when this task
+ * stops making progress for three minutes.
  */
 static void wan_task(void *arg)
 {
-    const router_config_t *cfg = router_config_get();
+    /* Settings are reboot-applied. Keep a private snapshot so a web save cannot
+     * race modem commands during the short delay before the scheduled reboot. */
+    const router_config_t *cfg = &s_wan_config;
 
+    wan_heartbeat();
     modem_pwrkey_init();
     modem_create(cfg);
 
     while (1) {
+        wan_heartbeat();
         status_set_state("waiting for modem");
         if (!modem_bring_up()) {
             status_set_state("modem unreachable");
-            vTaskDelay(pdMS_TO_TICKS(WAN_RETRY_DELAY_MS));
+            wan_delay(WAN_RETRY_DELAY_MS);
             continue;
         }
 
@@ -571,12 +845,14 @@ static void wan_task(void *arg)
         status_set_state("registering");
         if (!modem_wait_registered()) {
             status_set_state("no network");
-            vTaskDelay(pdMS_TO_TICKS(WAN_RETRY_DELAY_MS));
+            wan_delay(WAN_RETRY_DELAY_MS);
             continue;
         }
 
         status_set_state("dialling");
         ESP_LOGI(TAG, "Starting PPP ...");
+        /* Clear stale state before PPP can emit events for this attempt. */
+        xEventGroupClearBits(s_event_group, BIT_PPP_GOT_IP | BIT_PPP_LOST_IP);
         if (!modem_enter_data_mode()) {
             /* AT+CRESET is gentler and keeps the ~10 s power-on wait off the
              * table, so try it first; fall back to PWRKEY when the modem has
@@ -590,37 +866,120 @@ static void wan_task(void *arg)
             continue;
         }
 
-        xEventGroupClearBits(s_event_group, BIT_PPP_GOT_IP | BIT_PPP_LOST_IP);
         EventBits_t bits = xEventGroupWaitBits(s_event_group,
                                                BIT_PPP_GOT_IP | BIT_PPP_LOST_IP,
-                                               pdTRUE, pdFALSE,
+                                               pdFALSE, pdFALSE,
                                                pdMS_TO_TICKS(PPP_TIMEOUT_MS));
+        wan_heartbeat();
 
-        if (bits & BIT_PPP_GOT_IP) {
-            napt_enable();
-            s_status.wan_up = true;
-            status_set_state("connected");
-            ESP_LOGI(TAG, "Router operational  SSID=%s  LAN=%s",
-                     cfg->wifi_ssid, cfg->ap_ip);
+        bool router_operational = false;
+        if (bits & BIT_PPP_LOST_IP) {
+            xEventGroupClearBits(s_event_group, BIT_PPP_GOT_IP | BIT_PPP_LOST_IP);
+            ESP_LOGW(TAG, "PPP ended before the router became operational");
+            status_set_state("PPP connection failed");
+        } else if (bits & BIT_PPP_GOT_IP) {
+            xEventGroupClearBits(s_event_group, BIT_PPP_GOT_IP);
 
-            /* Block until the link drops, then fall through and redial. */
-            xEventGroupWaitBits(s_event_group, BIT_PPP_LOST_IP,
-                                pdTRUE, pdFALSE, portMAX_DELAY);
-            s_status.wan_up = false;
-            ESP_LOGW(TAG, "PPP dropped — reconnecting in %d s ...",
-                     RECONNECT_DELAY_MS / 1000);
+            esp_err_t default_err = esp_netif_set_default_netif(s_ppp_netif);
+            if (default_err != ESP_OK) {
+                ESP_LOGW(TAG, "Could not select PPP as default route: %s",
+                         esp_err_to_name(default_err));
+            }
+
+            uint32_t main_dns;
+            uint32_t backup_dns;
+            status_lock();
+            main_dns = s_wan_dns_main;
+            backup_dns = s_wan_dns_backup;
+            status_unlock();
+            esp_err_t dns_err = ap_dhcps_set_dns(s_ap_netif, main_dns, backup_dns, true);
+            if (dns_err != ESP_OK) {
+                ESP_LOGW(TAG, "Keeping previous DHCP DNS after update failure");
+            }
+
+            if (napt_enable()) {
+                router_operational = true;
+                status_set_wan_up(true);
+                status_set_state("connected");
+                ESP_LOGI(TAG, "Router operational  SSID=%s  LAN=%s",
+                         cfg->wifi_ssid, cfg->ap_ip);
+
+                unsigned health_failures = 0;
+                while (1) {
+                    bits = xEventGroupWaitBits(s_event_group, BIT_PPP_LOST_IP,
+                                                pdTRUE, pdFALSE,
+                                                pdMS_TO_TICKS(WAN_HEALTH_INTERVAL_MS));
+                    wan_heartbeat();
+                    if (bits & BIT_PPP_LOST_IP) {
+                        ESP_LOGW(TAG, "PPP dropped — reconnecting in %d s ...",
+                                 RECONNECT_DELAY_MS / 1000);
+                        break;
+                    }
+
+                    if (wan_data_plane_healthy()) {
+                        if (health_failures > 0) {
+                            ESP_LOGI(TAG, "WAN data plane recovered");
+                        }
+                        health_failures = 0;
+                    } else {
+                        health_failures++;
+                        ESP_LOGW(TAG, "WAN health probe failed (%u/%u)",
+                                 health_failures, WAN_HEALTH_FAILURE_LIMIT);
+                        if (health_failures >= WAN_HEALTH_FAILURE_LIMIT) {
+                            ESP_LOGE(TAG, "PPP has an IP but internet is unreachable; redialling");
+                            status_set_state("internet unreachable");
+                            break;
+                        }
+                    }
+                }
+            } else {
+                status_set_state("NAPT unavailable");
+            }
         } else {
             ESP_LOGE(TAG, "PPP did not come up within %d s", PPP_TIMEOUT_MS / 1000);
             status_set_state("PPP timeout");
         }
 
+        status_set_wan_up(false);
+        if (router_operational) {
+            napt_disable();
+        }
+
         /* Back to a known state before the next dial. */
-        esp_modem_set_mode(s_dce, ESP_MODEM_MODE_COMMAND);
-        vTaskDelay(pdMS_TO_TICKS(RECONNECT_DELAY_MS));
+        esp_err_t command_err = esp_modem_set_mode(s_dce, ESP_MODEM_MODE_COMMAND);
+        if (command_err != ESP_OK) {
+            ESP_LOGW(TAG, "Could not leave PPP data mode: %s; power-cycling modem",
+                     esp_err_to_name(command_err));
+            status_set_state("power-cycling modem");
+            modem_power_cycle();
+        }
+        wan_delay(RECONNECT_DELAY_MS);
     }
 }
 
 /* ── app_main ────────────────────────────────────────────────── */
+
+static const char *reset_reason_name(esp_reset_reason_t reason)
+{
+    switch (reason) {
+        case ESP_RST_POWERON:    return "power-on";
+        case ESP_RST_EXT:        return "external reset";
+        case ESP_RST_SW:         return "software restart";
+        case ESP_RST_PANIC:      return "panic/abort";
+        case ESP_RST_INT_WDT:    return "interrupt watchdog";
+        case ESP_RST_TASK_WDT:   return "task watchdog";
+        case ESP_RST_WDT:        return "other watchdog";
+        case ESP_RST_DEEPSLEEP:  return "deep-sleep wake";
+        case ESP_RST_BROWNOUT:   return "brownout";
+        case ESP_RST_SDIO:       return "SDIO reset";
+        case ESP_RST_USB:        return "USB reset";
+        case ESP_RST_JTAG:       return "JTAG reset";
+        case ESP_RST_EFUSE:      return "eFuse error";
+        case ESP_RST_PWR_GLITCH: return "power glitch";
+        case ESP_RST_CPU_LOCKUP: return "CPU lockup";
+        default:                 return "unknown";
+    }
+}
 
 void app_main(void)
 {
@@ -635,8 +994,21 @@ void app_main(void)
     ESP_ERROR_CHECK(esp_netif_init());
     ESP_ERROR_CHECK(esp_event_loop_create_default());
 
+    s_status_mutex = xSemaphoreCreateMutex();
+    s_event_group = xEventGroupCreate();
+    assert(s_status_mutex);
+    assert(s_event_group);
+
+    const char *last_reset = reset_reason_name(esp_reset_reason());
+    status_lock();
+    strlcpy(s_status.reset_reason, last_reset, sizeof(s_status.reset_reason));
+    s_wan_heartbeat_tick = xTaskGetTickCount();
+    status_unlock();
+    ESP_LOGW(TAG, "Last reset reason: %s", last_reset);
+
     ESP_ERROR_CHECK(router_config_init());
     const router_config_t *cfg = router_config_get();
+    s_wan_config = *cfg;
 
     ESP_LOGI(TAG, "╔══════════════════════════════════╗");
     ESP_LOGI(TAG, "║  TTGO T-Internet-COM 4G Router   ║");
@@ -644,8 +1016,6 @@ void app_main(void)
     ESP_LOGI(TAG, "║  APN  : %-24s║", cfg->apn);
     ESP_LOGI(TAG, "║  Setup: http://%-17s║", cfg->ap_ip);
     ESP_LOGI(TAG, "╚══════════════════════════════════╝");
-
-    s_event_group = xEventGroupCreate();
 
     ESP_ERROR_CHECK(esp_event_handler_instance_register(
         IP_EVENT, ESP_EVENT_ANY_ID, on_ip_event, NULL, NULL));
@@ -657,7 +1027,12 @@ void app_main(void)
     wifi_ap_start(cfg);
     ESP_ERROR_CHECK(web_server_start());
 
-    xTaskCreate(wan_task, "wan", 4096, NULL, 5, NULL);
+    BaseType_t task_created = xTaskCreate(wan_task, "wan", 4096, NULL, 5,
+                                          &s_wan_task_handle);
+    if (task_created != pdPASS) {
+        ESP_LOGE(TAG, "Could not create WAN task; configuration UI remains available");
+        status_set_state("WAN task unavailable");
+    }
 
     /* Periodic status log */
     while (1) {
@@ -665,11 +1040,27 @@ void app_main(void)
 
         router_status_t st;
         router_status_get(&st);
+        TickType_t heartbeat_tick;
+        status_lock();
+        heartbeat_tick = s_wan_heartbeat_tick;
+        status_unlock();
+
+        if (s_wan_task_handle &&
+            (xTaskGetTickCount() - heartbeat_tick) > pdMS_TO_TICKS(WAN_STALL_TIMEOUT_MS)) {
+            ESP_LOGE(TAG, "WAN task has made no progress for %d seconds; restarting ESP32",
+                     WAN_STALL_TIMEOUT_MS / 1000);
+            esp_restart();
+        }
+
+        UBaseType_t wan_stack_min = s_wan_task_handle
+                                        ? uxTaskGetStackHighWaterMark(s_wan_task_handle)
+                                        : 0;
         /* pbufs come from the internal DRAM heap (MEM_LIBC_MALLOC=1), so a
          * collapsing internal-free number means ERR_MEM is real exhaustion
          * rather than the TCPIP thread stalling. */
-        ESP_LOGI(TAG, "[STATUS] wan=%s  clients=%d  heap_int=%u  heap_min=%u",
+        ESP_LOGI(TAG, "[STATUS] wan=%s  clients=%d  heap_int=%u  heap_min=%u  wan_stack_min=%u",
                  st.modem_state, st.clients,
-                 (unsigned)st.heap_free, (unsigned)st.heap_min);
+                 (unsigned)st.heap_free, (unsigned)st.heap_min,
+                 (unsigned)wan_stack_min);
     }
 }

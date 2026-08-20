@@ -46,6 +46,7 @@ extern "C" {
 #endif
 #define ROUTER_DEFAULT_WIFI_CHANNEL 6
 #define ROUTER_DEFAULT_WIFI_MAX_STA 10
+#define ROUTER_WIFI_CHANNEL_MAX     11
 
 typedef struct {
     /* WiFi access point */

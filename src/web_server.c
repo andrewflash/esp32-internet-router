@@ -123,6 +123,7 @@ static esp_err_t status_get_handler(httpd_req_t *req)
     cJSON_AddStringToObject(root, "operator",  st.operator_name);
     cJSON_AddStringToObject(root, "state",     st.modem_state);
     cJSON_AddNumberToObject(root, "uptime_s",  st.uptime_s);
+    cJSON_AddStringToObject(root, "reset_reason", st.reset_reason);
     cJSON_AddNumberToObject(root, "clients",   st.clients);
     cJSON_AddNumberToObject(root, "heap_free", st.heap_free);
     cJSON_AddNumberToObject(root, "heap_min",  st.heap_min);
@@ -232,9 +233,11 @@ static void deferred_restart_task(void *arg)
     esp_restart();
 }
 
-static void schedule_restart(void)
+static esp_err_t schedule_restart(void)
 {
-    xTaskCreate(deferred_restart_task, "reboot", 2048, NULL, 5, NULL);
+    return xTaskCreate(deferred_restart_task, "reboot", 2048, NULL, 5, NULL) == pdPASS
+               ? ESP_OK
+               : ESP_ERR_NO_MEM;
 }
 
 static esp_err_t config_post_handler(httpd_req_t *req)
@@ -285,13 +288,14 @@ static esp_err_t config_post_handler(httpd_req_t *req)
         return send_json_error(req, "400 Bad Request", reason);
     }
 
-    httpd_resp_set_type(req, "application/json");
-    esp_err_t ret = httpd_resp_sendstr(req, "{\"ok\":true}");
-
     if (reboot) {
-        schedule_restart();
+        if (schedule_restart() != ESP_OK) {
+            return send_json_error(req, "503 Service Unavailable",
+                                   "Settings saved, but the reboot task could not start");
+        }
     }
-    return ret;
+    httpd_resp_set_type(req, "application/json");
+    return httpd_resp_sendstr(req, "{\"ok\":true}");
 }
 
 static esp_err_t reboot_post_handler(httpd_req_t *req)
@@ -299,10 +303,11 @@ static esp_err_t reboot_post_handler(httpd_req_t *req)
     if (!request_authorized(req)) {
         return send_unauthorized(req);
     }
+    if (schedule_restart() != ESP_OK) {
+        return send_json_error(req, "503 Service Unavailable", "Reboot task could not start");
+    }
     httpd_resp_set_type(req, "application/json");
-    esp_err_t ret = httpd_resp_sendstr(req, "{\"ok\":true}");
-    schedule_restart();
-    return ret;
+    return httpd_resp_sendstr(req, "{\"ok\":true}");
 }
 
 static esp_err_t factory_reset_post_handler(httpd_req_t *req)
@@ -313,10 +318,12 @@ static esp_err_t factory_reset_post_handler(httpd_req_t *req)
     if (router_config_factory_reset() != ESP_OK) {
         return send_json_error(req, "500 Internal Server Error", "Erase failed");
     }
+    if (schedule_restart() != ESP_OK) {
+        return send_json_error(req, "503 Service Unavailable",
+                               "Settings erased, but the reboot task could not start");
+    }
     httpd_resp_set_type(req, "application/json");
-    esp_err_t ret = httpd_resp_sendstr(req, "{\"ok\":true}");
-    schedule_restart();
-    return ret;
+    return httpd_resp_sendstr(req, "{\"ok\":true}");
 }
 
 /* ── Start ───────────────────────────────────────────────────── */

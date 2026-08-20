@@ -30,8 +30,8 @@ into service. The factory values live at the top of
 
 | Tab | Settings |
 | --- | --- |
-| Status | WAN state, IP/gateway/DNS, operator, signal, clients, uptime, heap |
-| WiFi | SSID, password, channel, max clients, hidden SSID, LAN IP and netmask |
+| Status | WAN state, IP/gateway/DNS, operator, signal, clients, uptime, last reset, heap |
+| WiFi | SSID, password, channel 1-11, max clients, hidden SSID, LAN IP and netmask |
 | Internet | APN, PPP username/password, SIM PIN |
 | System | Admin username/password, reboot, factory reset |
 
@@ -45,6 +45,14 @@ REST endpoints, if you'd rather script it: `GET /api/status`,
 
 The WiFi AP and the config UI start before the modem and stay up regardless of
 it, so a wrong APN or a missing SIM can always be fixed from a browser.
+
+The DHCP server advertises fallback DNS while cellular is starting. When the
+carrier supplies DNS, connected stations are re-associated once so they renew
+their leases instead of remaining connected with stale DNS. While PPP is up,
+the router performs a DNS data-plane check every 30 seconds; three consecutive
+failures trigger a PPP redial even when the modem never reports a lost-IP event.
+The last ESP32 reset reason is retained on the status page to distinguish a
+software restart or watchdog from a brownout.
 
 ## Building
 

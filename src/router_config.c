@@ -14,6 +14,8 @@ static const char *TAG = "config";
 
 static router_config_t s_cfg;
 
+static void sanitize_loaded_config(void);
+
 /* ── NVS helpers ─────────────────────────────────────────────── */
 
 static void load_str(nvs_handle_t h, const char *key,
@@ -92,6 +94,7 @@ esp_err_t router_config_init(void)
     load_str(h, "admin_user", s_cfg.admin_user, sizeof(s_cfg.admin_user), ROUTER_DEFAULT_ADMIN_USER);
     load_str(h, "admin_pass", s_cfg.admin_pass, sizeof(s_cfg.admin_pass), ROUTER_DEFAULT_ADMIN_PASS);
 
+    sanitize_loaded_config();
     nvs_close(h);
     return ESP_OK;
 }
@@ -107,6 +110,25 @@ static bool valid_ipv4(const char *s)
     return s[0] != '\0' && esp_netif_str_to_ip4(s, &addr) == ESP_OK;
 }
 
+static void sanitize_loaded_config(void)
+{
+    if (s_cfg.wifi_channel < 1 || s_cfg.wifi_channel > ROUTER_WIFI_CHANNEL_MAX) {
+        ESP_LOGW(TAG, "Stored WiFi channel %u is unsupported; using channel %u",
+                 (unsigned)s_cfg.wifi_channel, (unsigned)ROUTER_DEFAULT_WIFI_CHANNEL);
+        s_cfg.wifi_channel = ROUTER_DEFAULT_WIFI_CHANNEL;
+    }
+    if (s_cfg.wifi_max_sta < 1 || s_cfg.wifi_max_sta > ROUTER_DEFAULT_WIFI_MAX_STA) {
+        ESP_LOGW(TAG, "Stored max-client value %u is invalid; using %u",
+                 (unsigned)s_cfg.wifi_max_sta, (unsigned)ROUTER_DEFAULT_WIFI_MAX_STA);
+        s_cfg.wifi_max_sta = ROUTER_DEFAULT_WIFI_MAX_STA;
+    }
+    if (!valid_ipv4(s_cfg.ap_ip) || !valid_ipv4(s_cfg.ap_netmask)) {
+        ESP_LOGW(TAG, "Stored LAN settings are invalid; using factory subnet");
+        strlcpy(s_cfg.ap_ip, ROUTER_DEFAULT_AP_IP, sizeof(s_cfg.ap_ip));
+        strlcpy(s_cfg.ap_netmask, ROUTER_DEFAULT_AP_NETMASK, sizeof(s_cfg.ap_netmask));
+    }
+}
+
 esp_err_t router_config_save(const router_config_t *cfg, const char **err)
 {
     const char *reason = NULL;
@@ -118,8 +140,8 @@ esp_err_t router_config_save(const router_config_t *cfg, const char **err)
         reason = "SSID must be 1-32 characters";
     } else if (pass_len != 0 && (pass_len < 8 || pass_len > 63)) {
         reason = "WiFi password must be empty (open) or 8-63 characters";
-    } else if (cfg->wifi_channel < 1 || cfg->wifi_channel > 13) {
-        reason = "WiFi channel must be 1-13";
+    } else if (cfg->wifi_channel < 1 || cfg->wifi_channel > ROUTER_WIFI_CHANNEL_MAX) {
+        reason = "WiFi channel must be 1-11";
     } else if (cfg->wifi_max_sta < 1 || cfg->wifi_max_sta > 10) {
         reason = "Max clients must be 1-10";
     } else if (!valid_ipv4(cfg->ap_ip)) {

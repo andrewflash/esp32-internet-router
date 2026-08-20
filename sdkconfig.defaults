@@ -6,6 +6,11 @@ CONFIG_SPIRAM_USE_MALLOC=y
 # lwIP: IP forwarding and NAPT (required for PPP → SoftAP routing)
 # LWIP_NAPT_TMOUT / LWIP_NAPT_TMOUT_UDP are C-level macros, not Kconfig symbols.
 CONFIG_LWIP_PPP_SUPPORT=y
+# The router is IPv4-only. IPv6CP can stall some modem/carrier combinations.
+CONFIG_LWIP_PPP_ENABLE_IPV6=n
+# Credentials configured in the UI need both common PPP auth methods compiled in.
+CONFIG_LWIP_PPP_PAP_SUPPORT=y
+CONFIG_LWIP_PPP_CHAP_SUPPORT=y
 CONFIG_LWIP_IP_FORWARD=y
 CONFIG_LWIP_IPV4_NAPT=y
 
@@ -17,6 +22,8 @@ CONFIG_LWIP_L2_TO_L3_COPY=y
 # WiFi RX buffers
 CONFIG_ESP_WIFI_STATIC_RX_BUFFER_NUM=10
 CONFIG_ESP_WIFI_DYNAMIC_RX_BUFFER_NUM=32
+# Keep the DHCP lease table aligned with wifi_config_t.max_connection.
+CONFIG_LWIP_DHCPS_MAX_STATION_NUM=10
 
 # lwIP TCPIP task mailbox. This really is the resource that runs out: with
 # MEMP_MEM_MALLOC=1 the memp count limits are ignored and the heap stays at
@@ -39,8 +46,10 @@ CONFIG_LWIP_TCPIP_RECVMBOX_SIZE=256
 CONFIG_LWIP_TCPIP_TASK_AFFINITY_CPU1=y
 CONFIG_LWIP_TCPIP_TASK_STACK_SIZE=6144
 
-# Watchdog timeout — modem boot can take several seconds
+# Watchdog timeout — modem boot can take several seconds. Panic is required so
+# CPU starvation recovers instead of only printing a warning forever.
 CONFIG_ESP_TASK_WDT_TIMEOUT_S=30
+CONFIG_ESP_TASK_WDT_PANIC=y
 
 # 3 MB app partition — the 1 MB default cannot hold the firmware plus the
 # esp_modem debug strings below.
